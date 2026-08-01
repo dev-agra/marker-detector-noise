@@ -1129,6 +1129,18 @@ function warpGrey(grey, w, h, quad, out, margin) {
 // ══════════════════════════════════════════════════════════════════
 // APP LAYER
 // ══════════════════════════════════════════════════════════════════
+// Report load-time failures in the UI. Without this a top-level throw leaves
+// the page frozen on its initial HTML -- status stuck at "Starting", every
+// metric a dash -- with no indication that the script died.
+window.addEventListener('error', ev => {
+  const d = document.getElementById('dot'), s = document.getElementById('stxt');
+  const m = document.getElementById('msg');
+  if (s) s.textContent = 'Script error';
+  if (d) d.style.background = 'var(--bad)';
+  if (m) m.textContent = 'Startup failed: ' + (ev.message || ev) +
+                         (ev.lineno ? '  (line ' + ev.lineno + ')' : '');
+});
+
 const $ = id => document.getElementById(id);
 const video = $('video'), overlay = $('overlay'), oCtx = overlay.getContext('2d');
 const procC = document.createElement('canvas');
@@ -1139,6 +1151,20 @@ const rCtx = roiC.getContext('2d', { willReadFrequently: true });
 const fCtx = fullC.getContext('2d', { willReadFrequently: true });
 const cropC = $('crop'), cCtx = cropC.getContext('2d');
 const dbgC = $('dbg-canvas'), dCtx = dbgC.getContext('2d', { willReadFrequently: true });
+
+// ══ BUILD SWITCH ══ 'empty' = blank data region, 'noise' = dense data region.
+// The noise build adds a morphological opening pre-pass that erases the fine
+// data grid so the L finder survives as its own blob. It costs ~2x and needs
+// ~10px per coarse module instead of ~6px.
+const MARKER_MODE = 'noise';
+const MOD_FLOOR = MARKER_MODE === 'noise' ? 10 : 6;
+// Blur ceiling in MODULES of 10-90% edge rise. The noise build is far
+// stricter: its data grid is ~5x finer than a module, so a smear that leaves
+// the finder pattern perfectly readable has already destroyed the payload.
+const BLUR_CEIL = MARKER_MODE === 'noise' ? 0.30 : 0.45;
+const BLUR_REL = MARKER_MODE === 'noise' ? 1.25 : 1.5;   // vs the best this device manages
+const BLUR_STALL = 25;          // frames of blur before giving up on a capture
+let opts = { binarizer: 'hybrid', dataRegion: MARKER_MODE };
 
 const PROC_LONG = 400;          // pass 1: whole-frame detection resolution
 // Pass 2 for small markers (e.g. a 7mm print): a centre crop at NATIVE
@@ -1175,19 +1201,7 @@ let acc = null, accN = 0, accSize = 0, bestSharp = -1, bestFrame = null;
 let lockedMeta = null, missStreak = 0;
 let fCount = 0, fpsT = 0;
 let showAveraged = true;
-// ══ BUILD SWITCH ══ 'empty' = blank data region, 'noise' = dense data region.
-// The noise build adds a morphological opening pre-pass that erases the fine
-// data grid so the L finder survives as its own blob. It costs ~2x and needs
-// ~10px per coarse module instead of ~6px.
-const MARKER_MODE = 'noise';
-const MOD_FLOOR = MARKER_MODE === 'noise' ? 10 : 6;
-// Blur ceiling in MODULES of 10-90% edge rise. The noise build is far
-// stricter: its data grid is ~5x finer than a module, so a smear that leaves
-// the finder pattern perfectly readable has already destroyed the payload.
-const BLUR_CEIL = MARKER_MODE === 'noise' ? 0.30 : 0.45;
-const BLUR_REL = MARKER_MODE === 'noise' ? 1.25 : 1.5;   // vs the best this device manages
-const BLUR_STALL = 25;          // frames of blur before giving up on a capture
-let opts = { binarizer: 'hybrid', dataRegion: MARKER_MODE };
+
 let DPR = 1;
 let xf = { ox: 0, oy: 0, s: 1 };   // proc -> video transform of the winning pass
 let zoom = 1, camZoom = null, digitalZoom = 1;
