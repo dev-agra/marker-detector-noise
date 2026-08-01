@@ -913,6 +913,141 @@ function measureBlur(grey, w, h, quad, module) {
            kind: (trust && ratio > 1.7) ? 'motion' : 'defocus' };
 }
 
+
+// ── Min-area rectangle (rotating calipers) ────────────────────────
+function minAreaRect(hull) {
+  let best = null;
+  const n = hull.length;
+  for (let i = 0; i < n; i++) {
+    const a = hull[i], b = hull[(i + 1) % n];
+    let ex = b[0] - a[0], ey = b[1] - a[1];
+    const len = Math.hypot(ex, ey);
+    if (len < 1e-9) continue;
+    ex /= len; ey /= len;
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+    for (let j = 0; j < n; j++) {
+      const dx = hull[j][0] - a[0], dy = hull[j][1] - a[1];
+      const u = dx * ex + dy * ey, v = -dx * ey + dy * ex;
+      if (u < minU) minU = u; if (u > maxU) maxU = u;
+      if (v < minV) minV = v; if (v > maxV) maxV = v;
+    }
+    const area = (maxU - minU) * (maxV - minV);
+    if (!best || area < best.area) best = { area, a, ex, ey, minU, maxU, minV, maxV };
+  }
+  if (!best) return null;
+  const { a, ex, ey, minU, maxU, minV, maxV } = best;
+  const P = (u, v) => [a[0] + u * ex - v * ey, a[1] + u * ey + v * ex];
+  return { corners: [P(minU, minV), P(maxU, minV), P(maxU, maxV), P(minU, maxV)],
+           sideA: maxU - minU, sideB: maxV - minV };
+}
+
+// ── Unified OUTLINE detector ──────────────────────────────────────
+// Finds the marker without caring what fills the data region.
+//
+// The L's two arms always span the full side length, so the largest blob's
+// min-area rectangle is the symbol square whether the interior is blank,
+// speckled with fine noise, or solid ink. The finder ring is then read purely
+// from the OUTLINE: sample a thin band just inside each of the four sides;
+// two read as continuous ink (the L arms) and two as a ~50% alternating run
+// (the timing pattern). The interior is never consulted.
+//
+// The band must stay shallower than one module, or a solid interior would
+// register as ink behind every timing gap and all four sides would look solid.
+function detectOutline(comp, bin, w, h, cfg) {
+  const hull = convexHull(rowExtremes(comp, w));
+  if (hull.length < 4) return { ok: false, reason: 'degenerate blob' };
+  const rect = minAreaRect(hull);
+  if (!rect) return { ok: false, reason: 'no bounding rectangle' };
+  const S = Math.max(rect.sideA, rect.sideB), Sm = Math.min(rect.sideA, rect.sideB);
+  const sq = Sm / S;
+  if (sq < cfg.minSquareness) return { ok: false, reason: 'outline not square (' + sq.toFixed(2) + ')' };
+
+  const C = rect.corners;
+  const centre = [(C[0][0] + C[2][0]) / 2, (C[0][1] + C[2][1]) / 2];
+  const ink = (x, y) => {
+    const ix = (x + 0.5) | 0, iy = (y + 0.5) | 0;
+    return (ix < 0 || iy < 0 || ix >= w || iy >= h) ? 0 : bin[iy * w + ix];
+  };
+  const OUT = S * 0.025, IN = S * 0.030, N = cfg.outlineSamples;
+
+  const cov = [], surf = [], seq = [], dirs = [];
+  for (let k = 0; k < 4; k++) {
+    const p0 = C[k], p1 = C[(k + 1) % 4];
+    let ex = p1[0] - p0[0], ey = p1[1] - p0[1];
+    const L = Math.hypot(ex, ey); ex /= L; ey /= L;
+    let nx = -ey, ny = ex;
+    const mid = [(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2];
+    if ((centre[0] - mid[0]) * nx + (centre[1] - mid[1]) * ny < 0) { nx = -nx; ny = -ny; }
+    dirs.push({ ex, ey, nx, ny, L, p0 });
+    let hits = 0;
+    const pts = [], hit = [];
+    for (let i = 0; i < N; i++) {
+      const t = (i + 0.5) / N;
+      const bx = p0[0] + ex * L * t, by = p0[1] + ey * L * t;
+      let found = null;
+      for (let d = -OUT; d <= IN; d += 0.5) {
+        if (ink(bx + nx * d, by + ny * d)) { found = d; break; }
+      }
+      hit.push(found !== null ? 1 : 0);
+      if (found !== null) { hits++; pts.push([bx + nx * found, by + ny * found]); }
+    }
+    cov.push(hits / N); surf.push(pts); seq.push(hit);
+  }
+
+  const solid = cov.map(c => c >= cfg.outlineSolid);
+  const nSolid = solid.filter(Boolean).length;
+  if (nSolid !== 2)
+    return { ok: false, reason: 'need 2 solid edges, got ' + nSolid +
+             ' [' + cov.map(c => c.toFixed(2)).join(' ') + ']', rect };
+  const s1 = solid.indexOf(true), s2 = solid.lastIndexOf(true);
+  if ((s2 - s1) % 2 === 0) return { ok: false, reason: 'solid edges opposite, not adjacent', rect };
+  for (let k = 0; k < 4; k++) {
+    if (!solid[k] && (cov[k] < cfg.outlineTimingLo || cov[k] > cfg.outlineTimingHi))
+      return { ok: false, reason: 'edge ' + k + ' is neither solid nor alternating (' +
+               cov[k].toFixed(2) + ')', rect };
+  }
+
+  // Module size straight from the alternating run lengths of the timing edges.
+  const runs = [];
+  for (let k = 0; k < 4; k++) {
+    if (solid[k]) continue;
+    const q = seq[k];
+    let len = 1;
+    const local = [];
+    for (let i = 1; i < q.length; i++) {
+      if (q[i] === q[i - 1]) len++; else { local.push(len); len = 1; }
+    }
+    local.push(len);
+    if (local.length > 2) runs.push(...local.slice(1, -1));   // drop truncated ends
+  }
+  if (runs.length < 3) return { ok: false, reason: 'no timing rhythm on the outline', rect };
+  runs.sort((a, b) => a - b);
+  const module = runs[runs.length >> 1] * (S / N);
+  const est = S / module;
+  const dim = cfg.snapToStandard ? snapDim(est, cfg.dimTol) : 2 * Math.round(est / 2);
+  if (!dim || dim < cfg.minDim || dim > cfg.maxDim)
+    return { ok: false, reason: 'implausible module count (' + est.toFixed(1) + ')', rect };
+
+  // Every side already has its outer ink surface sampled -- fit those directly.
+  const lines = surf.map((pts, k) => pts.length >= 8
+    ? fitLineRobust(pts, Math.max(1.2, S * 0.02)).line
+    : lineFromPointDir(C[k], [dirs[k].ex, dirs[k].ey]));
+
+  const vIdx = [s1, (s1 + 1) % 4].find(i => [s2, (s2 + 1) % 4].includes(i));
+  if (vIdx === undefined) return { ok: false, reason: 'solid edges share no corner', rect };
+  // Each arm's far end is where it meets the side OPPOSITE the other arm.
+  // Intersecting a side with its own opposite would be two parallel lines.
+  const o1 = (s1 + 2) % 4, o2 = (s2 + 2) % 4;
+  const V = intersect(lines[s1], lines[s2]);
+  const E1 = intersect(lines[s1], lines[o2]);
+  const E2 = intersect(lines[s2], lines[o1]);
+  const F = intersect(lines[o1], lines[o2]);
+  if (!V || !E1 || !E2 || !F) return { ok: false, reason: 'edge intersection failed', rect };
+
+  return { ok: true, V, E1, E2, F, dim, module, S, cov, rectCorners: C,
+           timing: cov.filter((c, k) => !solid[k]).map(c => Math.round(c * 100)) };
+}
+
 // Valid ECC200 square symbol sizes. Snapping to this list is free and it
 // catches module-count misreads: 28 or 30 modules is not a DataMatrix, so an
 // estimate landing there is a measurement error, not a smaller symbol.
@@ -930,9 +1065,14 @@ function snapDim(est, tolFrac) {
 // ── Top level ─────────────────────────────────────────────────────
 const DEFAULTS = {
   binarizer: 'hybrid',
+  // outline detector (interior-agnostic primary strategy)
+  minSquareness: 0.72,
+  outlineSamples: 128, outlineSolid: 0.88,
+  outlineTimingLo: 0.24, outlineTimingHi: 0.74,
   dataRegion: 'empty',   // 'empty' | 'noise'
   openFrac: 0.55,
   openLadder: [1.0, 0.68, 1.45, 0.5],
+  rescueOpening: true, rescueRungs: 2,
   win: 25, C: 8,
   minBlobArea: 8,
   simplifyFrac: 0.03,
@@ -952,22 +1092,20 @@ const DEFAULTS = {
 
 function detectMarker(grey, w, h, opts) {
   const cfg = Object.assign({}, DEFAULTS, opts || {});
-  if (cfg.dataRegion === 'noise') {
-    // The distance transform reads the thickest ink structure. Usually that
-    // is the L bar, but once the data region is too coarse to resolve it
-    // merges into masses thicker than the L and the estimate runs high,
-    // making the opening eat the finder pattern. Retrying a couple of
-    // structuring-element sizes recovers most of that band; the extra cost
-    // is only paid on frames that would otherwise have failed outright.
-    let last = null;
-    for (const mult of cfg.openLadder) {
-      const r = detectOnce(grey, w, h, Object.assign({}, cfg, { openMult: mult }));
-      if (r.ok) return r;
-      if (!last) last = r;
-    }
-    return last;
+  // Plain pass: no morphology, no distance transform. The outline strategy is
+  // interior-agnostic, so blank, noisy and solid data regions all resolve here.
+  const r = detectOnce(grey, w, h, Object.assign({}, cfg, { dataRegion: 'none' }));
+  if (r.ok || cfg.rescueOpening === false) return r;
+  // Rescue: a very fine data region can bleed into the finder badly enough to
+  // spoil the outline sampling. An opening between the two grid scales cleans
+  // it up, but it costs several times a plain pass, so it only runs when a
+  // marker-sized blob was actually present and everything else failed.
+  if (!r.tried.length) return r;
+  for (const mult of cfg.openLadder.slice(0, cfg.rescueRungs)) {
+    const r2 = detectOnce(grey, w, h, Object.assign({}, cfg, { dataRegion: 'noise', openMult: mult }));
+    if (r2.ok) return r2;
   }
-  return detectOnce(grey, w, h, cfg);
+  return r;
 }
 
 function detectOnce(grey, w, h, cfg) {
@@ -992,79 +1130,94 @@ function detectOnce(grey, w, h, cfg) {
     if (comp.touchesBorder) { tried.push({ comp, reason: 'runs off the frame edge' }); continue; }
     if (span > cfg.maxSizeFrac * minSide) { tried.push({ comp, reason: 'fills the frame' }); continue; }
 
-    const L = findL(comp, w, h, cfg);
-    if (!L.ok) { tried.push({ comp, reason: L.reason, poly: L.poly }); continue; }
-
-    // Far edges. The side opposite arm A pivots on A2 (the end of arm B).
-    const dirA = V.sub(L.A1, L.V), dirB = V.sub(L.A2, L.V);
-    const guess = [L.V, L.A1, [L.A1[0] + dirB[0], L.A1[1] + dirB[1]], L.A2];
-    const cands = moduleCandidates(comps, L, guess);
-    const tA = timingEdge(L, cands, L.A2, dirA, cfg);   // opposite arm A
-    const tB = timingEdge(L, cands, L.A1, dirB, cfg);   // opposite arm B
-    const farA = tA.line || lineFromPointDir(L.A2, dirA);
-    const farB = tB.line || lineFromPointDir(L.A1, dirB);
-
-    const expTiming = Math.max(1, Math.floor((L.dim / 2 - 1) * 0.4));
-    if (tA.count + tB.count < 4 || tA.count < 1 || tB.count < 1 ||
-        Math.max(tA.count, tB.count) < expTiming) {
-      tried.push({ comp, reason: 'no timing pattern on the far edges (' + tA.count + '+' + tB.count + ')' });
-      continue;
-    }
-
-    const c00 = L.V;
-    const cA = intersect(L.lineA, farB);   // end of arm A
-    const cB = intersect(L.lineB, farA);   // end of arm B
-    const cFF = intersect(farA, farB);
-    if (!cA || !cB || !cFF) { tried.push({ comp, reason: 'edge intersection failed' }); continue; }
-
-    // Canonical order: L on the left and bottom. For a non-mirrored view
-    // the handedness of the two arms fixes this uniquely.
-    let TL = cA, BR = cB;
-    if (V.cross(V.sub(TL, c00), V.sub(BR, c00)) < 0) { const s = TL; TL = BR; BR = s; }
-    const quad = { tl: pt(TL), tr: pt(cFF), br: pt(BR), bl: pt(c00) };
-
-    const sides = [d2(quad.tl, quad.tr), d2(quad.tr, quad.br), d2(quad.br, quad.bl), d2(quad.bl, quad.tl)];
-    const rMin = Math.min(...sides) / Math.max(...sides);
-    if (rMin < cfg.quadRatioMin) {
-      tried.push({ comp, reason: 'final quad too skewed (' + rMin.toFixed(2) + ')' });
-      continue;
-    }
-    const P4 = [quad.tl, quad.tr, quad.br, quad.bl].map(p => [p.x, p.y]);
-    let convex = true, sgn = 0;
-    for (let i = 0; i < 4; i++) {
-      const cz = V.cross(V.sub(P4[(i + 1) % 4], P4[i]), V.sub(P4[(i + 2) % 4], P4[(i + 1) % 4]));
-      if (sgn === 0) sgn = Math.sign(cz);
-      else if (Math.sign(cz) !== sgn) convex = false;
-    }
-    if (!convex) { tried.push({ comp, reason: 'final quad not convex' }); continue; }
-    // Module count from TIMING PITCH, not stroke thickness. Blur plus
-    // thresholding dilates dark strokes, which inflates t and would make a
-    // 10x10 read as 8x8. Centroid spacing is immune to that.
-    const meanSide = sides.reduce((a, b) => a + b, 0) / 4;
-    let dim = L.dim, module = L.t, dimFrom = 'stroke';
-    const pitches = [tA.pitch, tB.pitch].filter(p => p > 0);
-    if (pitches.length) {
-      const mp = pitches.reduce((a, b) => a + b, 0) / pitches.length;
-      const est = meanSide / mp;
-      const d2 = cfg.snapToStandard ? snapDim(est, cfg.dimTol)
-                                    : (Math.round(est) + (Math.round(est) & 1 ? (est - Math.round(est) > 0 ? 1 : -1) : 0));
-      if (d2 && d2 >= cfg.minDim && d2 <= cfg.maxDim) {
-        dim = d2; module = meanSide / d2; dimFrom = 'timing-pitch';
+    // Two strategies, each carried all the way through verification. A
+    // geometry that assembles but fails the border check must fall through to
+    // the other strategy, not abandon the blob -- they fail on different
+    // things, so either alone is weaker than both in sequence.
+    const assemble = (geo, extra) => {
+      let TL = geo.E1, BR = geo.E2;
+      if (V.cross(V.sub(TL, geo.V), V.sub(BR, geo.V)) < 0) { const t = TL; TL = BR; BR = t; }
+      const quad = { tl: pt(TL), tr: pt(geo.F), br: pt(BR), bl: pt(geo.V) };
+      const sides = [d2(quad.tl, quad.tr), d2(quad.tr, quad.br), d2(quad.br, quad.bl), d2(quad.bl, quad.tl)];
+      const rMin = Math.min(...sides) / Math.max(...sides);
+      if (rMin < cfg.quadRatioMin) return { fail: 'quad too skewed (' + rMin.toFixed(2) + ')' };
+      const P4 = [quad.tl, quad.tr, quad.br, quad.bl].map(p => [p.x, p.y]);
+      let convex = true, sgn = 0;
+      for (let i = 0; i < 4; i++) {
+        const cz = V.cross(V.sub(P4[(i + 1) % 4], P4[i]), V.sub(P4[(i + 2) % 4], P4[(i + 1) % 4]));
+        if (sgn === 0) sgn = Math.sign(cz);
+        else if (Math.sign(cz) !== sgn) convex = false;
       }
-    }
-    const blur = measureBlur(grey, w, h, quad, module);
-    const verify = verifyBorder(bin, w, h, quad, dim);
-    if (verify < cfg.minVerify) {
-      tried.push({ comp, reason: 'border check failed (' + (verify * 100).toFixed(0) + '% of modules match)' });
-      continue;
-    }
-    return {
-      ok: true, bin, comps, quad, dim, module, dimFrom, openedWith, verify, blur, side: (sides[0] + sides[2]) / 2,
-      fill: L.fill, apexRatio: L.apexRatio, armCos: L.armCos,
-      timing: { a: tA.count, b: tB.count, modulesA: tA.modules, modulesB: tB.modules },
-      refined: !!(tA.line && tB.line),
-      L, tried
+      if (!convex) return { fail: 'quad not convex' };
+
+      const meanSide = sides.reduce((x, y) => x + y, 0) / 4;
+      let dim = geo.dim, module = geo.module, dimFrom = extra.via;
+      if (geo.pitch > 0) {
+        // Module count from timing PITCH rather than stroke thickness: blur
+        // plus thresholding dilates strokes and would make a 10x10 read 8x8.
+        const est = meanSide / geo.pitch;
+        const d = cfg.snapToStandard ? snapDim(est, cfg.dimTol) : 2 * Math.round(est / 2);
+        if (d && d >= cfg.minDim && d <= cfg.maxDim) { dim = d; module = meanSide / d; dimFrom = 'timing-pitch'; }
+      } else {
+        module = meanSide / dim;
+      }
+      const verify = verifyBorder(bin, w, h, quad, dim);
+      if (verify < cfg.minVerify)
+        return { fail: 'border check ' + (verify * 100).toFixed(0) + '%' };
+      const blur = measureBlur(grey, w, h, quad, module);
+      return Object.assign({
+        ok: true, bin, comps, quad, dim, module, dimFrom, openedWith, verify, blur,
+        side: (sides[0] + sides[2]) / 2, tried
+      }, extra);
     };
+
+    const strategies = [
+      () => {                                   // interior-agnostic outline
+        const g = detectOutline(comp, bin, w, h, cfg);
+        if (!g.ok) return { fail: g.reason };
+        return { geo: g, extra: { via: 'outline', cov: g.cov, refined: true,
+          timing: { a: g.timing[0], b: g.timing[1], modulesA: [], modulesB: [] },
+          L: { poly: g.rectCorners } } };
+      },
+      () => {                                   // L-hull: better under perspective
+        const L = findL(comp, w, h, cfg);
+        if (!L.ok) return { fail: L.reason };
+        const dirA = V.sub(L.A1, L.V), dirB = V.sub(L.A2, L.V);
+        const guess = [L.V, L.A1, [L.A1[0] + dirB[0], L.A1[1] + dirB[1]], L.A2];
+        const cands = moduleCandidates(comps, L, guess);
+        const tA = timingEdge(L, cands, L.A2, dirA, cfg);
+        const tB = timingEdge(L, cands, L.A1, dirB, cfg);
+        const expTiming = Math.max(1, Math.floor((L.dim / 2 - 1) * 0.4));
+        if (tA.count + tB.count < 4 || tA.count < 1 || tB.count < 1 ||
+            Math.max(tA.count, tB.count) < expTiming)
+          return { fail: 'no timing pattern (' + tA.count + '+' + tB.count + ')' };
+        const farA = tA.line || lineFromPointDir(L.A2, dirA);
+        const farB = tB.line || lineFromPointDir(L.A1, dirB);
+        const cA = intersect(L.lineA, farB), cB = intersect(L.lineB, farA);
+        const cFF = intersect(farA, farB);
+        if (!cA || !cB || !cFF) return { fail: 'edge intersection failed' };
+        const pitches = [tA.pitch, tB.pitch].filter(p => p > 0);
+        return {
+          geo: { V: L.V, E1: cA, E2: cB, F: cFF, dim: L.dim, module: L.t,
+                 pitch: pitches.length ? pitches.reduce((x, y) => x + y, 0) / pitches.length : 0 },
+          extra: { via: 'l-hull', fill: L.fill, apexRatio: L.apexRatio, armCos: L.armCos, L,
+                   timing: { a: tA.count, b: tB.count, modulesA: tA.modules, modulesB: tB.modules },
+                   refined: !!(tA.line && tB.line) }
+        };
+      }
+    ];
+
+    const fails = [];
+    let done = null;
+    for (const strat of strategies) {
+      const s = strat();
+      if (s.fail) { fails.push(s.fail); continue; }
+      const r = assemble(s.geo, s.extra);
+      if (r.ok) { done = r; break; }
+      fails.push(s.extra.via + ': ' + r.fail);
+    }
+    if (done) return done;
+    tried.push({ comp, reason: fails.join('  |  ') });
   }
   return { ok: false, bin, comps, tried, openedWith, reason: tried.length ? tried[0].reason : 'nothing marker-sized in frame' };
 }
@@ -1152,19 +1305,21 @@ const fCtx = fullC.getContext('2d', { willReadFrequently: true });
 const cropC = $('crop'), cCtx = cropC.getContext('2d');
 const dbgC = $('dbg-canvas'), dCtx = dbgC.getContext('2d', { willReadFrequently: true });
 
-// ══ BUILD SWITCH ══ 'empty' = blank data region, 'noise' = dense data region.
-// The noise build adds a morphological opening pre-pass that erases the fine
-// data grid so the L finder survives as its own blob. It costs ~2x and needs
-// ~10px per coarse module instead of ~6px.
-const MARKER_MODE = 'noise';
-const MOD_FLOOR = MARKER_MODE === 'noise' ? 10 : 6;
+// One detector for every data region. The finder is read from the symbol's
+// OUTLINE -- two solid edges and two alternating edges -- so a blank, noisy or
+// solid-ink interior all resolve through the same path with no mode switch.
+const MARKER_MODE = 'universal';
+const MOD_FLOOR = 9;            // detection-frame px per module
 // Blur ceiling in MODULES of 10-90% edge rise. The noise build is far
 // stricter: its data grid is ~5x finer than a module, so a smear that leaves
 // the finder pattern perfectly readable has already destroyed the payload.
-const BLUR_CEIL = MARKER_MODE === 'noise' ? 0.30 : 0.45;
-const BLUR_REL = MARKER_MODE === 'noise' ? 1.25 : 1.5;   // vs the best this device manages
+// Kept at the stricter setting: a smear that leaves the finder readable can
+// still have destroyed a fine data payload. Relax to 0.45 / 1.5 if you only
+// ever scan blank markers.
+const BLUR_CEIL = 0.30;
+const BLUR_REL = 1.25;          // vs the best this device manages
 const BLUR_STALL = 25;          // frames of blur before giving up on a capture
-let opts = { binarizer: 'hybrid', dataRegion: MARKER_MODE };
+let opts = { binarizer: 'hybrid' };
 
 const PROC_LONG = 400;          // pass 1: whole-frame detection resolution
 // Pass 2 for small markers (e.g. a 7mm print): a centre crop at NATIVE
@@ -1179,7 +1334,7 @@ const CAPTURE_TARGET = 6;
 // Once the marker is found, search only where it was, at only the resolution
 // needed. The detector needs ~10px per module; running at 19px costs 2.6x the
 // time for no accuracy gain, and a full-ROI search re-scans mostly empty paper.
-const TARGET_MODULE = MARKER_MODE === 'noise' ? 14 : 9;
+const TARGET_MODULE = 13;
 const TRACK_MARGIN = 1.4;       // search box vs marker size
 const TRACK_LOST = 3;           // failed tracked frames before a full re-search
 const STABLE_NEEDED = 2;        // consecutive consistent frames before capturing
@@ -1226,7 +1381,7 @@ function humanReason(r) {
 }
 
 // ── camera ────────────────────────────────────────────────────────
-$('mode').textContent = MARKER_MODE === 'noise' ? 'noise data region' : 'empty data region';
+$('mode').textContent = 'any data region';
 
 async function startCamera() {
   setStatus('Requesting camera…', 'var(--muted)');
@@ -1741,7 +1896,9 @@ function drawDebug(res, pw, ph) {
     dCtx.beginPath(); dCtx.arc(P[3][0], P[3][1], 4, 0, 7); dCtx.fill();
   }
   $('dbg-note').textContent = res.ok
-    ? 'apex ' + res.apexRatio.toFixed(2) + ' · fill ' + res.fill.toFixed(2) +
+    ? (res.via === 'outline'
+        ? 'outline · edges ' + res.cov.map(c => c.toFixed(2)).join('/')
+        : 'L-hull · apex ' + res.apexRatio.toFixed(2) + ' · fill ' + res.fill.toFixed(2)) +
       ' · verify ' + (res.verify * 100).toFixed(0) + '%' +
       (res.openedWith ? ' · SE ' + res.openedWith + 'px' : '') +
       ' · blobs ' + res.comps.length
