@@ -1146,10 +1146,21 @@ const PROC_LONG = 400;          // pass 1: whole-frame detection resolution
 // far under the ~6px floor, so it must never be scaled down. The ROI size
 // also sets the smallest detectable marker: span must exceed 10% of it.
 const ROI_FRAC = 0.5, ROI_MAX = 640;
-const CAPTURE_TARGET = 15;
-const STABLE_NEEDED = 3;        // consecutive consistent frames before capturing
+// Averaging saturates fast. Measured against a noise-free reference, RMS
+// error goes 8.44 (1 frame) -> 5.50 (4) -> 4.89 (6) -> 4.14 (15): frames 6-15
+// buy 15% more for 60% more waiting. Six is the knee of the curve.
+const CAPTURE_TARGET = 6;
+// Once the marker is found, search only where it was, at only the resolution
+// needed. The detector needs ~10px per module; running at 19px costs 2.6x the
+// time for no accuracy gain, and a full-ROI search re-scans mostly empty paper.
+const TARGET_MODULE = MARKER_MODE === 'noise' ? 14 : 9;
+const TRACK_MARGIN = 1.4;       // search box vs marker size
+const TRACK_LOST = 3;           // failed tracked frames before a full re-search
+const STABLE_NEEDED = 2;        // consecutive consistent frames before capturing
 const STABLE_TOL = 0.025;       // corner jitter allowed, as a fraction of side
-const TRACK_TOL = 0.15;         // corner drift allowed during capture
+// Every captured frame is warped with ITS OWN homography, so hand drift does
+// not misregister the average -- it only needs to still be the same marker.
+const TRACK_TOL = 0.60;
 // Output margin in modules. 0 = tight crop: the output's outer edge IS the
 // symbol's outer edge, nothing but marker. Measured against the real printed
 // marker, the detected boundary lands within 0.013 modules of the true ink
@@ -1181,6 +1192,7 @@ let DPR = 1;
 let xf = { ox: 0, oy: 0, s: 1 };   // proc -> video transform of the winning pass
 let zoom = 1, camZoom = null, digitalZoom = 1;
 let riseHist = [], blurBase = null, blurStall = 0, acceptedRise = [];
+let track = null, trackMiss = 0;
 let pass = 1;
 
 // ── friendlier wording for the detector's reject reasons ──────────
@@ -1310,6 +1322,34 @@ function greyOf(ctx, w, h) {
   return g;
 }
 
+// Detect inside a square region of the full-res frame, scaled to `proc` px.
+function detectIn(sx, sy, s, proc, o) {
+  if (procC.width !== proc || procC.height !== proc) { procC.width = proc; procC.height = proc; }
+  pCtx.drawImage(fullC, sx, sy, s, s, 0, 0, proc, proc);
+  const r = detectMarker(greyOf(pCtx, proc, proc), proc, proc, o);
+  return { r, xf: { ox: sx, oy: sy, s: s / proc }, dim: proc };
+}
+
+function trackedRegion(vw, vh) {
+  if (!track) return null;
+  let s = Math.round(track.half * 2 * TRACK_MARGIN);
+  s = Math.max(64, Math.min(s, Math.min(vw, vh)));
+  let x = Math.round(track.cx - s / 2), y = Math.round(track.cy - s / 2);
+  x = Math.max(0, Math.min(vw - s, x));
+  y = Math.max(0, Math.min(vh - s, y));
+  const k = Math.min(1, TARGET_MODULE / Math.max(1, track.moduleVideo));
+  const proc = Math.max(140, Math.min(Math.round(s * k), 520));
+  return { x, y, s, proc };
+}
+
+function updateTrack(res) {
+  const K = ['tl', 'tr', 'br', 'bl'].map(k => toVideo(res.quad[k]));
+  const cx = K.reduce((a, p) => a + p.x, 0) / 4, cy = K.reduce((a, p) => a + p.y, 0) / 4;
+  const half = Math.max(...K.map(p => Math.hypot(p.x - cx, p.y - cy)));
+  track = { cx, cy, half, moduleVideo: res.module * xf.s };
+  trackMiss = 0;
+}
+
 // ── main loop ─────────────────────────────────────────────────────
 function loop(ts) {
   requestAnimationFrame(loop);
@@ -1339,13 +1379,31 @@ function loop(ts) {
   fCtx.drawImage(video, 0, 0);
   positionGuide(vw, vh);
 
-  // PASS 1 — whole frame, downscaled. Cheap; finds normal-sized markers.
-  pCtx.drawImage(fullC, 0, 0, pw, ph);
   const t1 = performance.now();
-  let res = detectMarker(greyOf(pCtx, pw, ph), pw, ph, opts);
-  xf = { ox: 0, oy: 0, s: vw / pw };
-  pass = 1;
-  let dw = pw, dh = ph;
+  let res = null, dw = pw, dh = ph;
+
+  // PASS 0 — tracked window. Once locked, this is the only pass that runs:
+  // a small crop around where the marker was, at just enough resolution.
+  const tr = trackedRegion(vw, vh);
+  if (tr) {
+    const got = detectIn(tr.x, tr.y, tr.s, tr.proc, opts);
+    if (got.r.ok) {
+      res = got.r; xf = got.xf; pass = 0; dw = dh = got.dim;
+    } else if (++trackMiss < TRACK_LOST) {
+      res = got.r; xf = got.xf; pass = 0; dw = dh = got.dim;   // brief miss, keep tracking
+    } else {
+      track = null;                                            // lost: full re-search
+    }
+  }
+
+  // PASS 1 — whole frame, downscaled. Cheap; finds normal-sized markers.
+  if (!res || (!res.ok && !track)) {
+    if (procC.width !== pw || procC.height !== ph) { procC.width = pw; procC.height = ph; }
+    pCtx.drawImage(fullC, 0, 0, pw, ph);
+    res = detectMarker(greyOf(pCtx, pw, ph), pw, ph, opts);
+    xf = { ox: 0, oy: 0, s: vw / pw };
+    pass = 1; dw = pw; dh = ph;
+  }
 
   // PASS 2 — centre ROI at native resolution.
   // Runs when pass 1 finds nothing OR when pass 1 found the marker at too few
@@ -1356,31 +1414,29 @@ function loop(ts) {
   // success rather than the best available was systematically choosing the
   // worse answer, so pass 2 also runs whenever pass 1 is under the floor, and
   // wins if it saw the marker at higher resolution.
-  if (!res.ok || res.module < MOD_FLOOR) {
+  if (pass === 1 && (!res.ok || res.module < MOD_FLOOR)) {
     const roi = roiSize(vw, vh);
     const rx = Math.round((vw - roi) / 2), ry = Math.round((vh - roi) / 2);
-    if (roiC.width !== roi) { roiC.width = roi; roiC.height = roi; }
-    rCtx.drawImage(fullC, rx, ry, roi, roi, 0, 0, roi, roi);
     // If pass 1 already has a valid detection, pass 2 is an optional quality
     // upgrade, not a rescue -- so give it a single structuring-element attempt
-    // instead of the full retry ladder. Four failed rungs at native ROI
-    // resolution cost ~110ms; one costs ~12ms.
+    // instead of the full retry ladder. Four failed rungs cost ~110ms; one ~12ms.
     const opts2 = res.ok ? Object.assign({}, opts, { openLadder: [1.0] }) : opts;
-    const res2 = detectMarker(greyOf(rCtx, roi, roi), roi, roi, opts2);
-    const better = res2.ok && (!res.ok || res2.module > res.module);
-    if (better || (!res.ok && res2.tried.length > res.tried.length)) {
-      if (better) { xf = { ox: rx, oy: ry, s: 1 }; pass = 2; }
-      res = res2; dw = roi; dh = roi;
+    const got = detectIn(rx, ry, roi, Math.min(roi, 520), opts2);
+    const better = got.r.ok && (!res.ok || got.r.module > res.module);
+    if (better || (!res.ok && got.r.tried.length > res.tried.length)) {
+      if (better) { xf = got.xf; pass = 2; }
+      res = got.r; dw = dh = got.dim;
     }
   }
   const t2 = performance.now();
   setT('t-grey', t1 - t0); setT('t-det', t2 - t1); setT('t-tot', t2 - t0);
-  $('m-pass').textContent = pass === 2 ? 'ROI' : 'full';
+  $('m-pass').textContent = pass === 0 ? 'track' : (pass === 2 ? 'ROI' : 'full');
 
   drawDebug(res, dw, dh);
 
   if (!res.ok) {
     missStreak++;
+    if (missStreak > TRACK_LOST) track = null;
     say(humanReason(res.reason));
     if (missStreak > 6) {
       stableHist = [];
@@ -1390,6 +1446,7 @@ function loop(ts) {
     return;
   }
   missStreak = 0;
+  updateTrack(res);
 
   const map = procToDisplay();
   drawOverlay(res, map);
@@ -1398,7 +1455,7 @@ function loop(ts) {
   say('Marker locked · ' + res.dim + '×' + res.dim + ' · module ' + modPx.toFixed(1) + 'px' +
       (modPx < MOD_FLOOR ? ' (LOW — move closer)' : '') +
       ' · ' + (res.refined ? 'timing-refined' : 'estimated edges') +
-      ' · ' + (pass === 2 ? 'ROI pass' : 'full frame'));
+      ' · ' + (pass === 0 ? 'tracking' : pass === 2 ? 'ROI pass' : 'full frame'));
   $('m-dim').textContent = res.dim + '×' + res.dim;
   $('m-side').textContent = Math.round(res.side * xf.s) + 'px';
   $('m-mod').textContent = res.module.toFixed(1) + 'px';
@@ -1448,12 +1505,24 @@ function loop(ts) {
   }
 
   if (phase === 'capturing') {
-    if (drift(res.quad, lockedMeta.quad) > TRACK_TOL) { abortCapture(); return; }
-    grabFullRes(res, vw, vh);
-    if (res.blur) acceptedRise.push(res.blur.rise);
-    const pct = Math.round(accN / CAPTURE_TARGET * 100);
-    $('cap-fill').style.width = pct + '%';
-    $('cap-txt').textContent = 'Capturing ' + accN + '/' + CAPTURE_TARGET;
+    // A frame that has drifted is simply skipped, never a reason to throw the
+    // capture away: each frame carries its own homography, so drift cannot
+    // misregister the average. Only a jump big enough to be a different marker
+    // is rejected.
+    if (drift(res.quad, lockedMeta.quad) <= TRACK_TOL) {
+      grabFullRes(res, vw, vh);
+      if (res.blur) acceptedRise.push(res.blur.rise);
+      lockedMeta = res;
+      // Progressive: put a usable crop on screen from the FIRST good frame and
+      // sharpen it as more average in, instead of showing nothing until the
+      // last one lands.
+      render();
+      fillInfo(false);
+      $('empty').style.display = 'none';
+      $('result').style.display = 'flex';
+    }
+    $('cap-fill').style.width = Math.round(accN / CAPTURE_TARGET * 100) + '%';
+    $('cap-txt').textContent = 'Averaging ' + accN + '/' + CAPTURE_TARGET;
     if (accN >= CAPTURE_TARGET) finalize();
   }
 }
@@ -1541,12 +1610,19 @@ function finalize() {
   phase = 'done';
   $('cap').style.display = 'none';
   render();
+  fillInfo(true);
   $('empty').style.display = 'none';
   $('result').style.display = 'flex';
+  setStatus('Locked', 'var(--accent)');
+  say('Captured and aligned. Tap Scan again to redo.');
+}
+
+function fillInfo(done) {
   const q = lockedMeta.quad;
   $('i-dim').textContent = lockedMeta.dim + ' × ' + lockedMeta.dim + ' modules';
   $('i-rot').textContent = rotationOf(q).toFixed(1) + '° · L at bottom-left';
-  $('i-frames').textContent = accN + ' frames averaged';
+  $('i-frames').textContent = done ? accN + ' frames averaged'
+                                    : accN + '/' + CAPTURE_TARGET + ' frames — refining…';
   $('i-edges').textContent = lockedMeta.refined
     ? 'timing pattern (' + lockedMeta.timing.a + '+' + lockedMeta.timing.b + ' modules)'
     : 'estimated (no timing found)';
@@ -1557,8 +1633,6 @@ function finalize() {
     ? 'edge rise ' + ar[ar.length >> 1].toFixed(2) + ' modules (all ' + ar.length + ' frames under ' +
       Math.min(BLUR_CEIL, blurBase * BLUR_REL).toFixed(2) + ')'
     : '—';
-  setStatus('Locked', 'var(--accent)');
-  say('Captured and aligned. Tap Scan again to redo.');
 }
 
 function render() {
@@ -1684,6 +1758,7 @@ function setT(id, ms) { $(id).textContent = ms.toFixed(1); }
 // ── controls ──────────────────────────────────────────────────────
 $('again').addEventListener('click', () => {
   phase = 'scanning'; stableHist = []; acc = null; accN = 0; bestFrame = null;
+  track = null; trackMiss = 0; riseHist = []; blurBase = null;
   $('result').style.display = 'none';
   $('empty').style.display = 'flex';
   oCtx.clearRect(0, 0, overlay.width, overlay.height);
@@ -1710,7 +1785,7 @@ $('copy').addEventListener('click', async e => {
     cornersFullRes: Object.fromEntries(['tl', 'tr', 'br', 'bl'].map(n => {
       const v = toVideo(q[n]); return [n, [+v.x.toFixed(2), +v.y.toFixed(2)]];
     })),
-    detectionPass: pass === 2 ? 'native-roi' : 'full-frame',
+    detectionPass: pass === 0 ? 'tracked' : pass === 2 ? 'native-roi' : 'full-frame',
     markerMode: MARKER_MODE,
     borderVerify: +(lockedMeta.verify).toFixed(3),
     edgeRiseModules: lockedMeta.blur ? +lockedMeta.blur.rise.toFixed(3) : null,
