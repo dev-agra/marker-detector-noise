@@ -1313,12 +1313,19 @@ const MOD_FLOOR = 9;            // detection-frame px per module
 // Blur ceiling in MODULES of 10-90% edge rise. The noise build is far
 // stricter: its data grid is ~5x finer than a module, so a smear that leaves
 // the finder pattern perfectly readable has already destroyed the payload.
-// Kept at the stricter setting: a smear that leaves the finder readable can
-// still have destroyed a fine data payload. Relax to 0.45 / 1.5 if you only
-// ever scan blank markers.
-const BLUR_CEIL = 0.30;
-const BLUR_REL = 1.25;          // vs the best this device manages
+// Edge rise is measured in MODULES, so it scales as 1/module: the same optical
+// softness reads 0.36 at 12px per module and 0.23 at 22px. A tight absolute
+// ceiling therefore becomes a wall whose height depends on framing, and can
+// block every frame forever with no way forward. So the ceiling is now only an
+// outlier backstop -- gross defocus measures 0.69 at sigma 4 and 0.90 at
+// sigma 6 -- and the self-calibrating relative test does the real work.
+const BLUR_CEIL = 0.55;
+const BLUR_REL = 1.35;          // vs the best this device manages
 const BLUR_STALL = 25;          // frames of blur before giving up on a capture
+// A valid detection must never be blocked indefinitely. If the gate has
+// refused this many consecutive frames while detection keeps succeeding, this
+// is simply the best the setup can do: accept it and label the result soft.
+const BLUR_PATIENCE = 18;
 let opts = { binarizer: 'hybrid' };
 
 const PROC_LONG = 400;          // pass 1: whole-frame detection resolution
@@ -1361,6 +1368,7 @@ let DPR = 1;
 let xf = { ox: 0, oy: 0, s: 1 };   // proc -> video transform of the winning pass
 let zoom = 1, camZoom = null, digitalZoom = 1;
 let riseHist = [], blurBase = null, blurStall = 0, acceptedRise = [];
+let blurBlocked = 0, softCapture = false;
 let track = null, trackMiss = 0;
 let pass = 1;
 
@@ -1443,7 +1451,7 @@ function applyZoom(z) {
     digitalZoom = z;
     video.style.transform = z > 1 ? 'scale(' + z + ')' : '';
   }
-  stableHist = []; riseHist = []; blurBase = null;
+  stableHist = []; riseHist = []; blurBase = null; blurBlocked = 0; softCapture = false;
   if (phase === 'capturing') abortCapture();
 }
 
@@ -1643,12 +1651,16 @@ function loop(ts) {
     blurBase = srt[Math.floor(srt.length * 0.1)];
     const limit = Math.min(BLUR_CEIL, Math.max(blurBase * BLUR_REL, blurBase + 0.04));
     sharp = rise <= limit;
-    $('m-blur').textContent = rise.toFixed(2) + (sharp ? '' : '!');
-    $('m-blur').style.color = sharp ? 'var(--text)' : 'var(--bad)';
+    if (!sharp && ++blurBlocked > BLUR_PATIENCE) { sharp = true; softCapture = true; }
+    if (sharp && blurBlocked <= BLUR_PATIENCE) blurBlocked = 0;
+    $('m-blur').textContent = rise.toFixed(2) + (softCapture ? '~' : sharp ? '' : '!');
+    $('m-blur').style.color = softCapture ? 'var(--warn)' : sharp ? 'var(--text)' : 'var(--bad)';
     if (!sharp) {
+      const closer = res.module < MOD_FLOOR + 5;
       say(res.blur.kind === 'motion'
           ? 'Too much motion blur — hold still'
-          : 'Out of focus — hold steady while it focuses');
+          : closer ? 'Too soft — move closer so each module is bigger'
+                   : 'Out of focus — hold steady while it focuses');
       stableHist = [];
       if (phase === 'capturing' && ++blurStall > BLUR_STALL) abortCapture();
       return;
@@ -1792,16 +1804,21 @@ function fillInfo(done) {
   $('i-rot').textContent = rotationOf(q).toFixed(1) + '° · L at bottom-left';
   $('i-frames').textContent = done ? accN + ' frames averaged'
                                     : accN + '/' + CAPTURE_TARGET + ' frames — refining…';
-  $('i-edges').textContent = lockedMeta.refined
-    ? 'timing pattern (' + lockedMeta.timing.a + '+' + lockedMeta.timing.b + ' modules)'
-    : 'estimated (no timing found)';
+  $('i-edges').textContent = lockedMeta.via === 'outline'
+    ? 'symbol outline (edges ' + lockedMeta.cov.map(c => c.toFixed(2)).join('/') + ')'
+    : lockedMeta.refined
+      ? 'timing pattern (' + lockedMeta.timing.a + '+' + lockedMeta.timing.b + ' modules)'
+      : 'estimated (no timing found)';
   $('i-time').textContent = new Date().toLocaleTimeString('en-GB', { hour12: false });
   $('i-verify').textContent = (lockedMeta.verify * 100).toFixed(0) + '% of border modules match';
   const ar = acceptedRise.slice().sort((x, y) => x - y);
   $('i-blur').textContent = ar.length
-    ? 'edge rise ' + ar[ar.length >> 1].toFixed(2) + ' modules (all ' + ar.length + ' frames under ' +
-      Math.min(BLUR_CEIL, blurBase * BLUR_REL).toFixed(2) + ')'
+    ? 'edge rise ' + ar[ar.length >> 1].toFixed(2) + ' modules' +
+      (softCapture ? ' — SOFT: best this framing allowed, move closer for a crisper crop'
+                   : ' (all ' + ar.length + ' frames under ' +
+                     Math.min(BLUR_CEIL, blurBase * BLUR_REL).toFixed(2) + ')')
     : '—';
+  $('i-blur').style.color = softCapture ? 'var(--warn)' : '';
 }
 
 function render() {
@@ -1930,6 +1947,7 @@ function setT(id, ms) { $(id).textContent = ms.toFixed(1); }
 $('again').addEventListener('click', () => {
   phase = 'scanning'; stableHist = []; acc = null; accN = 0; bestFrame = null;
   track = null; trackMiss = 0; riseHist = []; blurBase = null;
+  blurBlocked = 0; softCapture = false;
   $('result').style.display = 'none';
   $('empty').style.display = 'flex';
   oCtx.clearRect(0, 0, overlay.width, overlay.height);
@@ -1960,6 +1978,8 @@ $('copy').addEventListener('click', async e => {
     markerMode: MARKER_MODE,
     borderVerify: +(lockedMeta.verify).toFixed(3),
     edgeRiseModules: lockedMeta.blur ? +lockedMeta.blur.rise.toFixed(3) : null,
+    softCapture: softCapture,
+    detectedVia: lockedMeta.via,
     zoom: +zoom.toFixed(2), zoomKind: camZoom ? 'camera' : 'digital',
     dimensionFrom: lockedMeta.dimFrom,
     frameSize: [video.videoWidth, video.videoHeight],
