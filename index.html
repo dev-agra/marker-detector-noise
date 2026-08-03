@@ -93,7 +93,7 @@
 <body>
 <div id="app">
   <header>
-    <h1>DataMatrix Localiser <span class="v">v20 · <b id="mode">—</b></span></h1>
+    <h1>DataMatrix Localiser <span class="v">v21 · <b id="mode">—</b></span></h1>
     <span id="stxt">Starting</span>
     <span id="dot"></span>
   </header>
@@ -222,10 +222,6 @@ function adaptiveThreshold(grey, w, h, win, C) {
 
 
 // ── Hybrid binariser (8x8 blocks, ZXing HybridBinarizer approach) ──
-// Local-MEAN thresholding punches holes in strokes thicker than the window.
-// This uses per-block dynamic range instead: a block with no contrast (the
-// inside of a thick bar) inherits its threshold from its neighbours, so
-// thick strokes stay solid while lighting gradients are still tracked.
 function hybridBinarize(grey, w, h) {
   const B = 8, MIN_DR = 24;
   const bw = Math.max(1, (w + B - 1) >> 3), bh = Math.max(1, (h + B - 1) >> 3);
@@ -278,22 +274,6 @@ function hybridBinarize(grey, w, h) {
 }
 
 
-// ── Pre-pass for markers with a DENSE DATA REGION ─────────────────
-// A noisy data region touches the L, fusing the whole symbol into one blob
-// and destroying the L-shape test. But the finder grid is much coarser than
-// the data grid, so a morphological OPENING with a structuring element
-// between the two scales erases the data and leaves the L and the timing
-// squares untouched.
-//
-// Opening is exact here, not approximate: a set that is a union of translates
-// of the SE is unchanged by opening. A bar of width t contains the k x k SE at
-// any rotation provided k*sqrt(2) <= t, so at k = 0.55t the L and the timing
-// modules survive byte-for-byte at every angle, while the data — which would
-// need a solid k x k block to survive — is wiped out.
-
-// Chamfer 3-4 distance transform; the largest inscribed disk in the whole ink
-// region sits in the L bar, so 2 * max(DT) recovers the coarse module size
-// with no prior knowledge of scale.
 function maxInscribedRadius(bin, w, h) {
   const d = new Int32Array(w * h);
   const INF = 1 << 28;
@@ -323,12 +303,6 @@ function maxInscribedRadius(bin, w, h) {
       hist[k]++;
     }
   }
-  // Not the maximum -- the largest radius that a MEANINGFUL NUMBER of pixels
-  // reach. The L is a long bar, so its whole centreline sits at radius t/2,
-  // giving hundreds of pixels. A thick data blob (say a coarse encoding cell
-  // fused to the L column) is compact and contributes only a handful at its
-  // peak radius, so the plain maximum would follow the blob and size the
-  // opening large enough to erase the finder.
   const MIN_COUNT = 24;
   let acc = 0;
   for (let k = 4095; k >= 1; k--) {
@@ -338,8 +312,6 @@ function maxInscribedRadius(bin, w, h) {
   return 0;
 }
 
-// Separable binary erosion/dilation via a running window count -- O(n),
-// independent of the structuring element size.
 function winPass(src, dst, w, h, r, horiz, needFull) {
   const span = 2 * r + 1;
   const n1 = horiz ? h : w, n2 = horiz ? w : h;
@@ -361,14 +333,13 @@ function openBinary(bin, w, h, k) {
   const r = k >> 1;
   if (r < 1) return bin;
   const t1 = new Uint8Array(w * h), t2 = new Uint8Array(w * h);
-  winPass(bin, t1, w, h, r, true, true);    // erode x
-  winPass(t1, t2, w, h, r, false, true);    // erode y
-  winPass(t2, t1, w, h, r, true, false);    // dilate x
-  winPass(t1, t2, w, h, r, false, false);   // dilate y
+  winPass(bin, t1, w, h, r, true, true);
+  winPass(t1, t2, w, h, r, false, true);
+  winPass(t2, t1, w, h, r, true, false);
+  winPass(t1, t2, w, h, r, false, false);
   return t2;
 }
 
-// ── Connected components (4-connected, iterative) ─────────────────
 function connectedComponents(bin, w, h, minArea) {
   const labels = new Int32Array(w * h);
   const stack = new Int32Array(w * h);
@@ -407,7 +378,6 @@ function connectedComponents(bin, w, h, minArea) {
   return comps;
 }
 
-// ── Small geometry library ────────────────────────────────────────
 const V = {
   sub: (a, b) => [a[0] - b[0], a[1] - b[1]],
   len: a => Math.hypot(a[0], a[1]),
@@ -458,7 +428,6 @@ function pointLineDist(p, a, b) {
   return Math.abs(V.cross(d, V.sub(p, a))) / l;
 }
 
-// Douglas-Peucker on an open polyline
 function simplifyOpen(pts, eps) {
   if (pts.length < 3) return pts.slice();
   let idx = -1, max = 0;
@@ -472,8 +441,6 @@ function simplifyOpen(pts, eps) {
   return a.slice(0, -1).concat(b);
 }
 
-// Simplify a closed hull: anchor on the two most distant vertices so the
-// result is rotation-stable, then simplify each half.
 function simplifyHull(hull, eps) {
   const n = hull.length;
   if (n < 4) return hull.slice();
@@ -506,7 +473,6 @@ function fitLine(pts) {
   return { a, b, c: -(a * mx + b * my) };
 }
 
-// Fit with one robust re-weighting pass (drop points beyond `tol`)
 function fitLineRobust(pts, tol) {
   let l = fitLine(pts);
   for (let it = 0; it < 2; it++) {
@@ -538,7 +504,6 @@ function projectOnLine(l, p) {
   return [p[0] - l.a * d, p[1] - l.b * d];
 }
 
-// ── Find the L: two arms from the hull ────────────────────────────
 function findL(comp, w, h, cfg, dbg) {
   const hull = convexHull(rowExtremes(comp, w));
   if (hull.length < 4) return { ok: false, reason: 'degenerate blob' };
@@ -549,7 +514,6 @@ function findL(comp, w, h, cfg, dbg) {
   const poly = simplifyHull(hull, Math.max(1.5, diameter * cfg.simplifyFrac));
   if (poly.length < 3) return { ok: false, reason: 'blob has no corners' };
 
-  // local mask for membership tests
   const bw = comp.maxx - comp.minx + 1, bh = comp.maxy - comp.miny + 1;
   const mask = new Uint8Array(bw * bh);
   for (let i = 0; i < comp.pixels.length; i++) {
@@ -562,7 +526,6 @@ function findL(comp, w, h, cfg, dbg) {
     return mask[iy * bw + ix] === 1;
   };
 
-  // Longest polygon edge = the diagonal spanning the two arm ends
   let di = -1, dl = 0;
   for (let i = 0; i < poly.length; i++) {
     const l = V.len(V.sub(poly[(i + 1) % poly.length], poly[i]));
@@ -570,7 +533,6 @@ function findL(comp, w, h, cfg, dbg) {
   }
   const P = poly[di], Q = poly[(di + 1) % poly.length];
 
-  // L vertex = furthest hull point from that diagonal, at ~|PQ|/2
   let vtx = null, vd = -1;
   for (const p of poly) {
     const d = pointLineDist(p, P, Q);
@@ -580,7 +542,6 @@ function findL(comp, w, h, cfg, dbg) {
   if (apexRatio < cfg.apexMin || apexRatio > cfg.apexMax)
     return { ok: false, reason: 'not L-shaped (apex ratio ' + apexRatio.toFixed(2) + ')', hull, poly };
 
-  // Arms
   let a1 = V.sub(P, vtx), a2 = V.sub(Q, vtx);
   const l1 = V.len(a1), l2 = V.len(a2);
   const ratio = Math.min(l1, l2) / Math.max(l1, l2);
@@ -593,12 +554,10 @@ function findL(comp, w, h, cfg, dbg) {
   const S = (l1 + l2) / 2;
   const centroid = [comp.cx, comp.cy];
 
-  // Sub-pixel refit of each arm's OUTER surface, plus stroke thickness
   function refitArm(endPt) {
     const seed = lineFromPointDir(vtx, V.sub(endPt, vtx));
     const dir = V.norm(V.sub(endPt, vtx));
     let nx = -dir[1], ny = dir[0];
-    // inward normal points toward the blob centroid
     if ((centroid[0] - vtx[0]) * nx + (centroid[1] - vtx[1]) * ny < 0) { nx = -nx; ny = -ny; }
     const L = V.len(V.sub(endPt, vtx));
     const surf = [], depths = [];
@@ -620,7 +579,7 @@ function findL(comp, w, h, cfg, dbg) {
       }
       depths.push(run);
     }
-    if (surf.length < N * 0.6) return null;   // arm surface not continuous -> not a solid arm
+    if (surf.length < N * 0.6) return null;
     depths.sort((p, q) => p - q);
     return {
       line: fitLineRobust(surf, Math.max(1.2, S * 0.02)).line,
@@ -641,8 +600,6 @@ function findL(comp, w, h, cfg, dbg) {
   if (modulesF < cfg.minDim - 1.5 || modulesF > cfg.maxDim + 4)
     return { ok: false, reason: 'implausible module count (' + modulesF.toFixed(1) + ')', hull, poly };
 
-  // Area check: an L of side S and stroke t covers 2tS - t^2.
-  // Rejects filled squares, blobs, letters, shadows.
   const expect = 2 * t * S - t * t;
   const fill = comp.area / expect;
   if (fill < cfg.fillMin || fill > cfg.fillMax)
@@ -659,14 +616,6 @@ function findL(comp, w, h, cfg, dbg) {
   };
 }
 
-// ── Timing-pattern edge fit ───────────────────────────────────────
-// The far side opposite an arm passes through that arm's END POINT, which
-// we already know accurately. So the only unknown is its ANGLE: sweep the
-// pencil of lines through that pivot and keep the angle with the most
-// timing modules on it. A one-dimensional Hough transform — immune to a
-// single merged/bridged blob dragging a least-squares fit, and it recovers
-// the true angle under perspective, where the far side is NOT parallel to
-// the opposite arm.
 function timingEdge(L, cands, pivot, alongDir, cfg) {
   const t = L.t;
   const base = Math.atan2(alongDir[1], alongDir[0]);
@@ -677,7 +626,7 @@ function timingEdge(L, cands, pivot, alongDir, cfg) {
   for (let th = base - span; th <= base + span; th += step) {
     const dir = [Math.cos(th), Math.sin(th)];
     const bound = lineFromPointDir(pivot, dir);
-    const mid = offsetAway(bound, -t / 2, L.centroid);   // half a module INWARD
+    const mid = offsetAway(bound, -t / 2, L.centroid);
     let count = 0, resid = 0;
     for (const c of cands) {
       const along = V.dot(V.sub(c, pivot), dir);
@@ -692,7 +641,6 @@ function timingEdge(L, cands, pivot, alongDir, cfg) {
   if (!best || best.count < cfg.minTiming) {
     return { line: null, count: best ? best.count : 0, modules: [], pitch: null };
   }
-  // Re-fit on the inliers for sub-pixel angle, keeping the pivot honest
   const inl = cands.filter(c => {
     const along = V.dot(V.sub(c, pivot), [Math.cos(best.th), Math.sin(best.th)]);
     return along >= -t * 0.7 && along <= L.S + t * 0.7 &&
@@ -703,10 +651,6 @@ function timingEdge(L, cands, pivot, alongDir, cfg) {
     const f = fitLineRobust(inl, tol);
     const cos = Math.abs(V.dot(V.norm([f.line.b, -f.line.a]), V.norm(alongDir)));
     if (cos > Math.cos(span + 0.05)) {
-      // Offset by half a module to go from centroids to the outer boundary --
-      // but use the module pitch measured AT THIS EDGE, not the pitch from the
-      // L arms. Under perspective the far edge's modules are smaller, and using
-      // the near-side t would push the boundary outside the ink.
       pitch = localPitch(inl, f.line, t);
       line = offsetAway(f.line, (pitch || t) / 2, L.centroid);
     }
@@ -714,11 +658,6 @@ function timingEdge(L, cands, pivot, alongDir, cfg) {
   return { line, count: inl.length, modules: inl, pitch };
 }
 
-// Timing modules alternate, so consecutive black centroids are 2 modules
-// apart. Use the MEDIAN gap, not the minimum: the corner module lies on both
-// timing lines and gets counted by both edges, producing one spuriously short
-// gap that would halve the estimate. Normalising each gap by its integer
-// multiple also absorbs modules dropped by blur or bridging.
 function localPitch(inl, line, fallbackT) {
   const dir = V.norm([line.b, -line.a]);
   const proj = inl.map(p => V.dot(p, dir)).sort((a, b) => a - b);
@@ -729,15 +668,11 @@ function localPitch(inl, line, fallbackT) {
   const p0 = med(gaps);
   if (!(p0 > 0)) return null;
   const unit = gaps.map(g => g / Math.max(1, Math.round(g / p0)));
-  const pitch = med(unit) / 2;                     // a gap spans 2 modules
+  const pitch = med(unit) / 2;
   if (!(pitch > 0.4 * fallbackT && pitch < 2.2 * fallbackT)) return null;
   return pitch;
 }
 
-
-// Candidate timing modules: blob area close to ONE module. A blob of two
-// bridged modules is ~2t^2 and must be excluded -- its centroid sits half a
-// module off the timing line and would tilt everything.
 function moduleCandidates(comps, L, quadGuess) {
   const t2 = L.t * L.t;
   const lo = 0.35 * t2, hi = 1.75 * t2;
@@ -755,13 +690,6 @@ function moduleCandidates(comps, L, quadGuess) {
   return out;
 }
 
-
-// ── Final verification: check the ANSWER, not the heuristics ──────
-// Sample the module centres around the symbol's border ring through the
-// homography we just solved. A correct quad reads: left column all ink,
-// bottom row all ink, top and right alternating. A quad that is even a
-// fraction of a module out scores badly, so this catches bad localisations
-// that every upstream heuristic happened to wave through.
 function verifyBorder(bin, w, h, quad, dim) {
   const H = homography(
     [[0, 0], [dim, 0], [dim, dim], [0, dim]],
@@ -782,11 +710,6 @@ function verifyBorder(bin, w, h, quad, dim) {
     }
     return k ? (n / k >= 0.5 ? 1 : 0) : -1;
   };
-  // The two solid arms must read as ink. The two timing sides must ALTERNATE
-  // -- but not necessarily in the standard phase: a marker may start its
-  // timing run black at either end, and the far corner may be either colour.
-  // Scoring each timing side against both phases and keeping the better one
-  // verifies the structural invariant without hard-coding a convention.
   let solidOk = 0, solidTot = 0;
   for (let i = 0; i < dim; i++) {
     for (const [u, v] of [[0.5, i + 0.5], [i + 0.5, dim - 0.5]]) {
@@ -811,28 +734,121 @@ function verifyBorder(bin, w, h, quad, dim) {
     top.push([i + 0.5, 0.5]);
     right.push([dim - 0.5, dim - 1 - i + 0.5]);
   }
-  // Both ENDS of each timing run are ambiguous and must be excluded. The far
-  // corner may be black or white depending on the marker's convention, and the
-  // near end abuts the solid L arm -- if the run starts black there, the arm
-  // and the first cell are two adjacent blacks, which reads as a break in the
-  // alternation even though the marker is perfectly formed. Scoring only the
-  // interior of each run tests the real invariant and costs 2 samples of 48.
   const solid = solidTot ? solidOk / solidTot : 0;
   return Math.min(solid, altScore(top.slice(1, dim - 1)), altScore(right.slice(1, dim - 1)));
 }
 
-
-// ── Blur measurement ──────────────────────────────────────────────
-// A generic Laplacian-variance score has no meaningful threshold: it moves
-// with exposure, contrast and scene. Here we know exactly where the marker's
-// two solid edges are and how many pixels a module spans, so we can measure
-// something physical instead -- the 10-90% intensity rise distance across a
-// known edge, expressed in MODULES. That is scale-free and directly says how
-// smeared the pattern is relative to its own feature size.
+// ══════════════════════════════════════════════════════════════════
+// NEW — EQUAL-WIDTH TIMING-CELL CHECK
 //
-// The two L arms are perpendicular, which also separates the two blur types:
-// defocus smears both equally, whereas motion blur only smears an edge whose
-// normal has a component along the motion, so it shows up as an asymmetry.
+// verifyBorder() (above) checks that the two timing sides alternate in
+// roughly the right rhythm, scored against the ALREADY-ASSUMED `dim`. It
+// does not check that the black cells are actually uniform in width, or
+// that there are exactly dim/2 of them. That gap lets a wrong-but-similar
+// pattern through: two adjacent timing cells fused together (no gap
+// between them) reduces the visible run count by one, which can still
+// score acceptably on alternation while being structurally wrong — and
+// critically, it can drag the module/dim ESTIMATE itself off by one,
+// so the fused pair doesn't even show up as an anomaly relative to the
+// (already wrong) assumed grid.
+//
+// This check re-derives the timing cells directly from the pixels of the
+// final, already-solved quad — independent of whatever `dim` the upstream
+// heuristics settled on — and requires exactly dim/2 black cells of equal
+// width on each timing side. Verified against real accept/reject examples:
+// a genuine symbol reads as N equal-width segments; a fabricated one that
+// merely mimics the alternation either has the wrong segment count or one
+// visibly-wider fused segment.
+function timingSegments(bin, w, h, pA, pB, inwardHint) {
+  const dx = pB.x - pA.x, dy = pB.y - pA.y, L = Math.hypot(dx, dy);
+  if (L < 4) return [];
+  const ux = dx / L, uy = dy / L;
+  let nx = -uy, ny = ux;
+  if (nx * inwardHint[0] + ny * inwardHint[1] < 0) { nx = -nx; ny = -ny; }
+  const module = L / Math.max(1, Math.round(L / Math.max(2, (arguments[7] || 10))));
+  // depth: sample inside the border stroke, not at the raw edge (avoids
+  // anti-aliasing/threshold noise right at the boundary)
+  const depth = (arguments[6] || 4) * 0.55;
+  // margin: skip the corner-adjacent partial cell in the PARALLEL direction
+  // (this is the fix verified earlier — using the same inset for both the
+  // parallel and perpendicular direction truncates the first cell and
+  // corrupts uniformity detection)
+  const margin = Math.max(2, (arguments[6] || 4) * 0.45);
+  const steps = Math.max(24, Math.round(L));
+  const segs = []; let cur = 0;
+  for (let i = 0; i <= steps; i++) {
+    const t = (margin + (L - 2 * margin) * (i / steps)) / L;
+    if (t < 0 || t > 1) continue;
+    const bx = pA.x + ux * L * t, by = pA.y + uy * L * t;
+    const x = Math.round(bx + nx * depth), y = Math.round(by + ny * depth);
+    const v = (x >= 0 && y >= 0 && x < w && y < h) ? bin[y * w + x] : 0;
+    if (v) cur++;
+    else { if (cur > 0) segs.push(cur); cur = 0; }
+  }
+  if (cur > 0) segs.push(cur);
+  return segs;
+}
+
+// Your production spec is a fixed 10x10 grid (5 alternating timing cells
+// per side) — verified against all 5 real accept examples, every one
+// measured dim=10. A differently-sized but INTERNALLY CONSISTENT fake
+// (e.g. a clean uniform 6-segment/dim=12 pattern) passes every shape check
+// there is, because it genuinely is a well-formed ECC200-style grid —
+// just not the one your marker uses. Uniformity alone can never catch
+// this, since there is nothing non-uniform about it; only a hard size
+// constraint does. Set to null to allow any ECC200 size instead.
+const REQUIRED_DIM = 10;
+
+function checkTimingUniform(bin, w, h, quad, dim, module) {
+  if (REQUIRED_DIM !== null && dim !== REQUIRED_DIM) {
+    return { pass: false, top: { pass: false, reason: 'dim=' + dim + ' need ' + REQUIRED_DIM },
+             right: { pass: false, reason: 'dim=' + dim + ' need ' + REQUIRED_DIM } };
+  }
+  const EXPECTED = dim / 2, TOL = 0.35;
+  const cx = (quad.tl.x + quad.tr.x + quad.br.x + quad.bl.x) / 4;
+  const cy = (quad.tl.y + quad.tr.y + quad.br.y + quad.bl.y) / 4;
+  function checkSide(pA, pB) {
+    const midx = (pA.x + pB.x) / 2, midy = (pA.y + pB.y) / 2;
+    const inward = [cx - midx, cy - midy];
+    const segs = timingSegments(bin, w, h, pA, pB, inward, module, 4);
+    if (segs.length !== EXPECTED) return { pass: false, reason: 'count=' + segs.length + ' need ' + EXPECTED, segs };
+    // The first and last segment abut the quad corners, which are
+    // inherently ambiguous (one corner sits against the solid L arm, the
+    // other against the far corner) — verifyBorder() above already treats
+    // both ends of a timing run as unreliable for exactly this reason
+    // (see its altScore(...slice(1, dim-1)) calls). Applying the same
+    // convention here: require the segment COUNT to be exactly right
+    // (that alone catches a fused/missing cell), and check WIDTH
+    // uniformity strictly on the interior segments, which are unambiguous.
+    if (segs.length <= 2) return { pass: true, segs };
+    const interior = segs.slice(1, -1);
+    const avg = interior.reduce((a, b) => a + b, 0) / interior.length;
+    for (const s of interior) {
+      if (Math.abs(s - avg) / avg > TOL) return { pass: false, reason: 'interior non-uniform ' + segs.join(','), segs };
+    }
+    // End caps get a WIDER tolerance band than the interior (both a lower
+    // bound — genuinely present, not a dropped cell — and an upper bound,
+    // which is what actually matters here: a fused pair landing on an end
+    // cap reads as ~1.5-2x the interior width, verified against a real
+    // reject example measuring 48 vs an interior average of ~31 (1.57x),
+    // versus a genuine truncated-but-real end cap measuring ~55% of the
+    // interior on the same real accept examples. The band [0.35, 1.4]
+    // cleanly separates the two, with margin on both sides.
+    for (const s of [segs[0], segs[segs.length - 1]]) {
+      const r = s / avg;
+      if (r < 0.35 || r > 1.4) return { pass: false, reason: 'end cell anomalous ' + segs.join(','), segs };
+    }
+    return { pass: true, segs };
+  }
+  // By construction (see assemble()): quad.bl is the L vertex, so the two
+  // SOLID arms are bl->tl and bl->br, and the two ALTERNATING sides are
+  // tl->tr (top) and tr->br (right).
+  const topR = checkSide(quad.tl, quad.tr);
+  const rightR = checkSide(quad.tr, quad.br);
+  return { pass: topR.pass && rightR.pass, top: topR, right: rightR };
+}
+
+
 function edgeRise(grey, w, h, from, to, inward, module) {
   const dx = to[0] - from[0], dy = to[1] - from[1];
   const L = Math.hypot(dx, dy);
@@ -855,10 +871,6 @@ function edgeRise(grey, w, h, from, to, inward, module) {
   for (let i = 0; i < N; i++) {
     const t = 0.12 + 0.76 * (i / (N - 1));
     const bx = from[0] + ex * L * t, by = from[1] + ey * L * t;
-    // Keep truncated profiles rather than discarding them: a marker that
-    // nearly fills the frame has little margin outside its edge, and throwing
-    // those profiles away would read as "unmeasurably blurred" on a perfectly
-    // sharp image.
     const prof = [], pos = [];
     let clipped = false;
     for (let d = -reach; d <= reach; d += step) {
@@ -869,7 +881,7 @@ function edgeRise(grey, w, h, from, to, inward, module) {
     if (prof.length < 6) { if (clipped) oob++; continue; }
     let lo = Infinity, hi = -Infinity;
     for (const v of prof) { if (v < lo) lo = v; if (v > hi) hi = v; }
-    if (hi - lo < 25) continue;                       // no real edge here
+    if (hi - lo < 25) continue;
     const t10 = lo + 0.1 * (hi - lo), t90 = lo + 0.9 * (hi - lo);
     const cross = lvl => {
       for (let j = 1; j < prof.length; j++) {
@@ -885,13 +897,9 @@ function edgeRise(grey, w, h, from, to, inward, module) {
     const r = Math.abs(p90 - p10);
     if (r < reach * 1.25) rises.push(r); else tooWide++;
   }
-  // Distinguish the two ways this can fail. Transitions running past the
-  // sampling window means genuinely, severely blurred. Profiles lost to the
-  // image border means we simply cannot judge, which must not be reported as
-  // blur.
   if (rises.length < 4) return tooWide > oob ? 99 : null;
   rises.sort((a, b) => a - b);
-  return rises[rises.length >> 1] / module;           // rise, in modules
+  return rises[rises.length >> 1] / module;
 }
 
 function measureBlur(grey, w, h, quad, module) {
@@ -905,16 +913,12 @@ function measureBlur(grey, w, h, quad, module) {
   if (!both.length) return null;
   const rise = Math.max(...both);
   const lo = Math.min(...both);
-  // Only trust the directional read while both edges are still measurable;
-  // once either saturates the asymmetry is an artefact, not real anisotropy.
   const trust = both.length === 2 && rise < 0.55;
   const ratio = both.length === 2 ? rise / Math.max(1e-6, lo) : 1;
   return { rise, riseLeft: a, riseBottom: b, ratio,
            kind: (trust && ratio > 1.7) ? 'motion' : 'defocus' };
 }
 
-
-// ── Min-area rectangle (rotating calipers) ────────────────────────
 function minAreaRect(hull) {
   let best = null;
   const n = hull.length;
@@ -941,18 +945,6 @@ function minAreaRect(hull) {
            sideA: maxU - minU, sideB: maxV - minV };
 }
 
-// ── Unified OUTLINE detector ──────────────────────────────────────
-// Finds the marker without caring what fills the data region.
-//
-// The L's two arms always span the full side length, so the largest blob's
-// min-area rectangle is the symbol square whether the interior is blank,
-// speckled with fine noise, or solid ink. The finder ring is then read purely
-// from the OUTLINE: sample a thin band just inside each of the four sides;
-// two read as continuous ink (the L arms) and two as a ~50% alternating run
-// (the timing pattern). The interior is never consulted.
-//
-// The band must stay shallower than one module, or a solid interior would
-// register as ink behind every timing gap and all four sides would look solid.
 function detectOutline(comp, bin, w, h, cfg) {
   const hull = convexHull(rowExtremes(comp, w));
   if (hull.length < 4) return { ok: false, reason: 'degenerate blob' };
@@ -1007,7 +999,6 @@ function detectOutline(comp, bin, w, h, cfg) {
                cov[k].toFixed(2) + ')', rect };
   }
 
-  // Module size straight from the alternating run lengths of the timing edges.
   const runs = [];
   for (let k = 0; k < 4; k++) {
     if (solid[k]) continue;
@@ -1018,7 +1009,7 @@ function detectOutline(comp, bin, w, h, cfg) {
       if (q[i] === q[i - 1]) len++; else { local.push(len); len = 1; }
     }
     local.push(len);
-    if (local.length > 2) runs.push(...local.slice(1, -1));   // drop truncated ends
+    if (local.length > 2) runs.push(...local.slice(1, -1));
   }
   if (runs.length < 3) return { ok: false, reason: 'no timing rhythm on the outline', rect };
   runs.sort((a, b) => a - b);
@@ -1028,15 +1019,12 @@ function detectOutline(comp, bin, w, h, cfg) {
   if (!dim || dim < cfg.minDim || dim > cfg.maxDim)
     return { ok: false, reason: 'implausible module count (' + est.toFixed(1) + ')', rect };
 
-  // Every side already has its outer ink surface sampled -- fit those directly.
   const lines = surf.map((pts, k) => pts.length >= 8
     ? fitLineRobust(pts, Math.max(1.2, S * 0.02)).line
     : lineFromPointDir(C[k], [dirs[k].ex, dirs[k].ey]));
 
   const vIdx = [s1, (s1 + 1) % 4].find(i => [s2, (s2 + 1) % 4].includes(i));
   if (vIdx === undefined) return { ok: false, reason: 'solid edges share no corner', rect };
-  // Each arm's far end is where it meets the side OPPOSITE the other arm.
-  // Intersecting a side with its own opposite would be two parallel lines.
   const o1 = (s1 + 2) % 4, o2 = (s2 + 2) % 4;
   const V = intersect(lines[s1], lines[s2]);
   const E1 = intersect(lines[s1], lines[o2]);
@@ -1048,9 +1036,6 @@ function detectOutline(comp, bin, w, h, cfg) {
            timing: cov.filter((c, k) => !solid[k]).map(c => Math.round(c * 100)) };
 }
 
-// Valid ECC200 square symbol sizes. Snapping to this list is free and it
-// catches module-count misreads: 28 or 30 modules is not a DataMatrix, so an
-// estimate landing there is a measurement error, not a smaller symbol.
 const ECC200_SQUARE = [10, 12, 14, 16, 18, 20, 22, 24, 26, 32, 36, 40, 44, 48, 52, 64,
                        72, 80, 88, 96, 104, 120, 132, 144];
 function snapDim(est, tolFrac) {
@@ -1062,14 +1047,12 @@ function snapDim(est, tolFrac) {
   return (best && bd <= tolFrac * best) ? best : null;
 }
 
-// ── Top level ─────────────────────────────────────────────────────
 const DEFAULTS = {
   binarizer: 'hybrid',
-  // outline detector (interior-agnostic primary strategy)
   minSquareness: 0.72,
   outlineSamples: 128, outlineSolid: 0.88,
   outlineTimingLo: 0.24, outlineTimingHi: 0.74,
-  dataRegion: 'empty',   // 'empty' | 'noise'
+  dataRegion: 'empty',
   openFrac: 0.55,
   openLadder: [1.0, 0.68, 1.45, 0.5],
   rescueOpening: true, rescueRungs: 2,
@@ -1086,20 +1069,15 @@ const DEFAULTS = {
   minSizeFrac: 0.10, maxSizeFrac: 0.98,
   quadRatioMin: 0.52,
   minVerify: 0.85,
+  minTimingUniform: true,
   snapToStandard: true, dimTol: 0.12,
   maxCandidates: 8
 };
 
 function detectMarker(grey, w, h, opts) {
   const cfg = Object.assign({}, DEFAULTS, opts || {});
-  // Plain pass: no morphology, no distance transform. The outline strategy is
-  // interior-agnostic, so blank, noisy and solid data regions all resolve here.
   const r = detectOnce(grey, w, h, Object.assign({}, cfg, { dataRegion: 'none' }));
   if (r.ok || cfg.rescueOpening === false) return r;
-  // Rescue: a very fine data region can bleed into the finder badly enough to
-  // spoil the outline sampling. An opening between the two grid scales cleans
-  // it up, but it costs several times a plain pass, so it only runs when a
-  // marker-sized blob was actually present and everything else failed.
   if (!r.tried.length) return r;
   for (const mult of cfg.openLadder.slice(0, cfg.rescueRungs)) {
     const r2 = detectOnce(grey, w, h, Object.assign({}, cfg, { dataRegion: 'noise', openMult: mult }));
@@ -1125,15 +1103,11 @@ function detectOnce(grey, w, h, cfg) {
 
   for (const comp of comps) {
     const span = Math.max(comp.maxx - comp.minx, comp.maxy - comp.miny);
-    if (span < cfg.minSizeFrac * minSide) break;    // sorted by area: nothing bigger follows
+    if (span < cfg.minSizeFrac * minSide) break;
     if (n++ >= cfg.maxCandidates) break;
     if (comp.touchesBorder) { tried.push({ comp, reason: 'runs off the frame edge' }); continue; }
     if (span > cfg.maxSizeFrac * minSide) { tried.push({ comp, reason: 'fills the frame' }); continue; }
 
-    // Two strategies, each carried all the way through verification. A
-    // geometry that assembles but fails the border check must fall through to
-    // the other strategy, not abandon the blob -- they fail on different
-    // things, so either alone is weaker than both in sequence.
     const assemble = (geo, extra) => {
       let TL = geo.E1, BR = geo.E2;
       if (V.cross(V.sub(TL, geo.V), V.sub(BR, geo.V)) < 0) { const t = TL; TL = BR; BR = t; }
@@ -1153,8 +1127,6 @@ function detectOnce(grey, w, h, cfg) {
       const meanSide = sides.reduce((x, y) => x + y, 0) / 4;
       let dim = geo.dim, module = geo.module, dimFrom = extra.via;
       if (geo.pitch > 0) {
-        // Module count from timing PITCH rather than stroke thickness: blur
-        // plus thresholding dilates strokes and would make a 10x10 read 8x8.
         const est = meanSide / geo.pitch;
         const d = cfg.snapToStandard ? snapDim(est, cfg.dimTol) : 2 * Math.round(est / 2);
         if (d && d >= cfg.minDim && d <= cfg.maxDim) { dim = d; module = meanSide / d; dimFrom = 'timing-pitch'; }
@@ -1164,6 +1136,19 @@ function detectOnce(grey, w, h, cfg) {
       const verify = verifyBorder(bin, w, h, quad, dim);
       if (verify < cfg.minVerify)
         return { fail: 'border check ' + (verify * 100).toFixed(0) + '%' };
+
+      // ── NEW: equal-width timing check, independent of the dim/module
+      // estimate that produced `quad` — this is what actually distinguishes
+      // a genuine symbol from something that merely alternates roughly the
+      // right amount. See comment on checkTimingUniform() above.
+      if (cfg.minTimingUniform) {
+        const tu = checkTimingUniform(bin, w, h, quad, dim, module);
+        if (!tu.pass) {
+          const why = !tu.top.pass ? ('top ' + tu.top.reason) : ('right ' + tu.right.reason);
+          return { fail: 'timing cells not uniform (' + why + ')' };
+        }
+      }
+
       const blur = measureBlur(grey, w, h, quad, module);
       return Object.assign({
         ok: true, bin, comps, quad, dim, module, dimFrom, openedWith, verify, blur,
@@ -1172,14 +1157,14 @@ function detectOnce(grey, w, h, cfg) {
     };
 
     const strategies = [
-      () => {                                   // interior-agnostic outline
+      () => {
         const g = detectOutline(comp, bin, w, h, cfg);
         if (!g.ok) return { fail: g.reason };
         return { geo: g, extra: { via: 'outline', cov: g.cov, refined: true,
           timing: { a: g.timing[0], b: g.timing[1], modulesA: [], modulesB: [] },
           L: { poly: g.rectCorners } } };
       },
-      () => {                                   // L-hull: better under perspective
+      () => {
         const L = findL(comp, w, h, cfg);
         if (!L.ok) return { fail: L.reason };
         const dirA = V.sub(L.A1, L.V), dirB = V.sub(L.A2, L.V);
@@ -1225,7 +1210,6 @@ function detectOnce(grey, w, h, cfg) {
 function pt(p) { return { x: p[0], y: p[1] }; }
 function d2(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
 
-// ── Warp ──────────────────────────────────────────────────────────
 function homography(src, dst) {
   const A = [], b = [];
   for (let i = 0; i < 4; i++) {
@@ -1282,9 +1266,6 @@ function warpGrey(grey, w, h, quad, out, margin) {
 // ══════════════════════════════════════════════════════════════════
 // APP LAYER
 // ══════════════════════════════════════════════════════════════════
-// Report load-time failures in the UI. Without this a top-level throw leaves
-// the page frozen on its initial HTML -- status stuck at "Starting", every
-// metric a dash -- with no indication that the script died.
 window.addEventListener('error', ev => {
   const d = document.getElementById('dot'), s = document.getElementById('stxt');
   const m = document.getElementById('msg');
@@ -1305,59 +1286,28 @@ const fCtx = fullC.getContext('2d', { willReadFrequently: true });
 const cropC = $('crop'), cCtx = cropC.getContext('2d');
 const dbgC = $('dbg-canvas'), dCtx = dbgC.getContext('2d', { willReadFrequently: true });
 
-// One detector for every data region. The finder is read from the symbol's
-// OUTLINE -- two solid edges and two alternating edges -- so a blank, noisy or
-// solid-ink interior all resolve through the same path with no mode switch.
 const MARKER_MODE = 'universal';
-const MOD_FLOOR = 9;            // detection-frame px per module
-// Blur ceiling in MODULES of 10-90% edge rise. The noise build is far
-// stricter: its data grid is ~5x finer than a module, so a smear that leaves
-// the finder pattern perfectly readable has already destroyed the payload.
-// Edge rise is measured in MODULES, so it scales as 1/module: the same optical
-// softness reads 0.36 at 12px per module and 0.23 at 22px. A tight absolute
-// ceiling therefore becomes a wall whose height depends on framing, and can
-// block every frame forever with no way forward. So the ceiling is now only an
-// outlier backstop -- gross defocus measures 0.69 at sigma 4 and 0.90 at
-// sigma 6 -- and the self-calibrating relative test does the real work.
+const MOD_FLOOR = 9;
 const BLUR_CEIL = 0.55;
-const BLUR_REL = 1.35;          // vs the best this device manages
-const BLUR_STALL = 25;          // frames of blur before giving up on a capture
-// A valid detection must never be blocked indefinitely. If the gate has
-// refused this many consecutive frames while detection keeps succeeding, this
-// is simply the best the setup can do: accept it and label the result soft.
+const BLUR_REL = 1.35;
+const BLUR_STALL = 25;
 const BLUR_PATIENCE = 18;
 let opts = { binarizer: 'hybrid' };
 
-const PROC_LONG = 400;          // pass 1: whole-frame detection resolution
-// Pass 2 for small markers (e.g. a 7mm print): a centre crop at NATIVE
-// resolution. Downsampling a 7mm marker to 400px leaves ~2px per module,
-// far under the ~6px floor, so it must never be scaled down. The ROI size
-// also sets the smallest detectable marker: span must exceed 10% of it.
+const PROC_LONG = 400;
 const ROI_FRAC = 0.5, ROI_MAX = 640;
-// Averaging saturates fast. Measured against a noise-free reference, RMS
-// error goes 8.44 (1 frame) -> 5.50 (4) -> 4.89 (6) -> 4.14 (15): frames 6-15
-// buy 15% more for 60% more waiting. Six is the knee of the curve.
 const CAPTURE_TARGET = 6;
-// Once the marker is found, search only where it was, at only the resolution
-// needed. The detector needs ~10px per module; running at 19px costs 2.6x the
-// time for no accuracy gain, and a full-ROI search re-scans mostly empty paper.
 const TARGET_MODULE = 13;
-const TRACK_MARGIN = 1.4;       // search box vs marker size
-const TRACK_LOST = 3;           // failed tracked frames before a full re-search
-const STABLE_NEEDED = 2;        // consecutive consistent frames before capturing
-const STABLE_TOL = 0.025;       // corner jitter allowed, as a fraction of side
-// Every captured frame is warped with ITS OWN homography, so hand drift does
-// not misregister the average -- it only needs to still be the same marker.
+const TRACK_MARGIN = 1.4;
+const TRACK_LOST = 3;
+const STABLE_NEEDED = 2;
+const STABLE_TOL = 0.025;
 const TRACK_TOL = 0.60;
-// Output margin in modules. 0 = tight crop: the output's outer edge IS the
-// symbol's outer edge, nothing but marker. Measured against the real printed
-// marker, the detected boundary lands within 0.013 modules of the true ink
-// edge, so a flush crop needs no dilation fudge.
 const MARGINS = [0, 0.5, 1];
 let marginIdx = 0;
 const QUIET = () => MARGINS[marginIdx];
 
-let phase = 'scanning';         // scanning | capturing | done
+let phase = 'scanning';
 let stableHist = [];
 let acc = null, accN = 0, accSize = 0, bestSharp = -1, bestFrame = null;
 let lockedMeta = null, missStreak = 0;
@@ -1365,14 +1315,13 @@ let fCount = 0, fpsT = 0;
 let showAveraged = true;
 
 let DPR = 1;
-let xf = { ox: 0, oy: 0, s: 1 };   // proc -> video transform of the winning pass
+let xf = { ox: 0, oy: 0, s: 1 };
 let zoom = 1, camZoom = null, digitalZoom = 1;
 let riseHist = [], blurBase = null, blurStall = 0, acceptedRise = [];
 let blurBlocked = 0, softCapture = false;
 let track = null, trackMiss = 0;
 let pass = 1;
 
-// ── friendlier wording for the detector's reject reasons ──────────
 function humanReason(r) {
   if (!r) return 'Looking for a marker…';
   if (r.includes('off the frame edge')) return 'Marker runs off the frame — move back';
@@ -1382,13 +1331,13 @@ function humanReason(r) {
   if (r.includes('arms unequal') || r.includes('not perpendicular')) return 'L pattern is distorted — flatten the angle';
   if (r.includes('area mismatch')) return 'Shape is not a hollow L — wrong target';
   if (r.includes('timing pattern')) return 'No timing pattern found — move closer or steady the camera';
+  if (r.includes('timing cells not uniform')) return 'Border pattern does not match a real marker';
   if (r.includes('module count')) return 'Stroke width does not match a DataMatrix';
   if (r.includes('not solid')) return 'L pattern is broken up — improve the lighting';
   if (r.includes('skewed') || r.includes('convex')) return 'Angle is too steep — hold the camera flatter';
   return r;
 }
 
-// ── camera ────────────────────────────────────────────────────────
 $('mode').textContent = 'any data region';
 
 async function startCamera() {
@@ -1419,11 +1368,6 @@ async function startCamera() {
   }
 }
 
-// ── zoom ──────────────────────────────────────────────────────────
-// Camera zoom crops the SENSOR before the frame is scaled to 1080p, so it
-// genuinely adds pixels across the marker. Digital zoom cannot -- it only
-// tightens the search region and the preview. Both are offered, but they are
-// labelled differently because only one of them raises px-per-module.
 function setupZoom(track, cap) {
   const sl = $('zoom');
   if (cap && cap.zoom && cap.zoom.max > cap.zoom.min) {
@@ -1455,11 +1399,8 @@ function applyZoom(z) {
   if (phase === 'capturing') abortCapture();
 }
 
-// ── coordinate mapping: proc space -> displayed video (object-fit: cover)
-// proc space -> video space, for whichever pass produced the result
 function toVideo(p) { return { x: xf.ox + p.x * xf.s, y: xf.oy + p.y * xf.s }; }
 
-// video space -> displayed pixels, accounting for object-fit: cover
 function videoToDisplay() {
   const cw = overlay.width, ch = overlay.height;
   const vw = video.videoWidth, vh = video.videoHeight;
@@ -1476,8 +1417,6 @@ function procToDisplay() {
   return p => d(toVideo(p));
 }
 
-// Place the on-screen guide box exactly over the small-marker ROI, so
-// "inside the box" means something precise rather than decorative.
 function positionGuide(vw, vh) {
   const roi = roiSize(vw, vh);
   const d = videoToDisplay();
@@ -1499,7 +1438,6 @@ function greyOf(ctx, w, h) {
   return g;
 }
 
-// Detect inside a square region of the full-res frame, scaled to `proc` px.
 function detectIn(sx, sy, s, proc, o) {
   if (procC.width !== proc || procC.height !== proc) { procC.width = proc; procC.height = proc; }
   pCtx.drawImage(fullC, sx, sy, s, s, 0, 0, proc, proc);
@@ -1527,7 +1465,6 @@ function updateTrack(res) {
   trackMiss = 0;
 }
 
-// ── main loop ─────────────────────────────────────────────────────
 function loop(ts) {
   requestAnimationFrame(loop);
   fCount++;
@@ -1549,9 +1486,6 @@ function loop(ts) {
   if (procC.width !== pw) { procC.width = pw; procC.height = ph; }
 
   const t0 = performance.now();
-  // Draw the full-res frame ONCE. Detection and the eventual crop must come
-  // from the same video frame, or hand motion between them shows up as a
-  // misaligned crop.
   if (fullC.width !== vw) { fullC.width = vw; fullC.height = vh; }
   fCtx.drawImage(video, 0, 0);
   positionGuide(vw, vh);
@@ -1559,21 +1493,18 @@ function loop(ts) {
   const t1 = performance.now();
   let res = null, dw = pw, dh = ph;
 
-  // PASS 0 — tracked window. Once locked, this is the only pass that runs:
-  // a small crop around where the marker was, at just enough resolution.
   const tr = trackedRegion(vw, vh);
   if (tr) {
     const got = detectIn(tr.x, tr.y, tr.s, tr.proc, opts);
     if (got.r.ok) {
       res = got.r; xf = got.xf; pass = 0; dw = dh = got.dim;
     } else if (++trackMiss < TRACK_LOST) {
-      res = got.r; xf = got.xf; pass = 0; dw = dh = got.dim;   // brief miss, keep tracking
+      res = got.r; xf = got.xf; pass = 0; dw = dh = got.dim;
     } else {
-      track = null;                                            // lost: full re-search
+      track = null;
     }
   }
 
-  // PASS 1 — whole frame, downscaled. Cheap; finds normal-sized markers.
   if (!res || (!res.ok && !track)) {
     if (procC.width !== pw || procC.height !== ph) { procC.width = pw; procC.height = ph; }
     pCtx.drawImage(fullC, 0, 0, pw, ph);
@@ -1582,21 +1513,9 @@ function loop(ts) {
     pass = 1; dw = pw; dh = ph;
   }
 
-  // PASS 2 — centre ROI at native resolution.
-  // Runs when pass 1 finds nothing OR when pass 1 found the marker at too few
-  // pixels per module to localise it well. Pass 1 works on a downscale, so a
-  // marker it can just barely see is one it locates poorly: measured against a
-  // full-resolution reference, pass 1 at 3-6px per module lands 0.8-4.1% out
-  // while pass 2 on the same frame lands 0.1-0.9% out. Taking the first
-  // success rather than the best available was systematically choosing the
-  // worse answer, so pass 2 also runs whenever pass 1 is under the floor, and
-  // wins if it saw the marker at higher resolution.
   if (pass === 1 && (!res.ok || res.module < MOD_FLOOR)) {
     const roi = roiSize(vw, vh);
     const rx = Math.round((vw - roi) / 2), ry = Math.round((vh - roi) / 2);
-    // If pass 1 already has a valid detection, pass 2 is an optional quality
-    // upgrade, not a rescue -- so give it a single structuring-element attempt
-    // instead of the full retry ladder. Four failed rungs cost ~110ms; one ~12ms.
     const opts2 = res.ok ? Object.assign({}, opts, { openLadder: [1.0] }) : opts;
     const got = detectIn(rx, ry, roi, Math.min(roi, 520), opts2);
     const better = got.r.ok && (!res.ok || got.r.module > res.module);
@@ -1627,8 +1546,7 @@ function loop(ts) {
 
   const map = procToDisplay();
   drawOverlay(res, map);
-  const modPx = res.module;          // detection-frame module: this is the
-                                     // figure the resolution floor refers to
+  const modPx = res.module;
   say('Marker locked · ' + res.dim + '×' + res.dim + ' · module ' + modPx.toFixed(1) + 'px' +
       (modPx < MOD_FLOOR ? ' (LOW — move closer)' : '') +
       ' · ' + (res.refined ? 'timing-refined' : 'estimated edges') +
@@ -1638,10 +1556,6 @@ function loop(ts) {
   $('m-mod').textContent = res.module.toFixed(1) + 'px';
   $('m-rot').textContent = rotationOf(res.quad).toFixed(1) + '°';
 
-  // ── blur gate ──────────────────────────────────────────────────
-  // Absolute ceiling catches gross blur; the relative test compares each
-  // frame against the sharpest this device has actually managed, which is
-  // what catches a motion-blur spike on an otherwise good stream.
   let sharp = true;
   if (res.blur) {
     const rise = res.blur.rise;
@@ -1668,7 +1582,6 @@ function loop(ts) {
     blurStall = 0;
   }
 
-  // ── stability gate: a single lucky frame must not start a capture ──
   stableHist.push(res.quad);
   if (stableHist.length > STABLE_NEEDED) stableHist.shift();
   const jit = jitter(stableHist);
@@ -1686,17 +1599,10 @@ function loop(ts) {
   }
 
   if (phase === 'capturing') {
-    // A frame that has drifted is simply skipped, never a reason to throw the
-    // capture away: each frame carries its own homography, so drift cannot
-    // misregister the average. Only a jump big enough to be a different marker
-    // is rejected.
     if (drift(res.quad, lockedMeta.quad) <= TRACK_TOL) {
       grabFullRes(res, vw, vh);
       if (res.blur) acceptedRise.push(res.blur.rise);
       lockedMeta = res;
-      // Progressive: put a usable crop on screen from the FIRST good frame and
-      // sharpen it as more average in, instead of showing nothing until the
-      // last one lands.
       render();
       fillInfo(false);
       $('empty').style.display = 'none';
@@ -1715,14 +1621,11 @@ function abortCapture() {
   setStatus('Scanning', 'var(--warn)');
 }
 
-// ── pull the crop from the FULL-RESOLUTION frame ──────────────────
-// Detection runs at 400px for speed; the deliverable must not. Only the
-// marker's bounding box is read back, so this stays cheap at 1080p.
 function grabFullRes(res, vw, vh) {
   const k = xf.s;
   const q = {}, keys = ['tl', 'tr', 'br', 'bl'];
   for (const key of keys) q[key] = toVideo(res.quad[key]);
-  const pad = res.module * k * (QUIET() + 2);   // source read margin, for bilinear sampling
+  const pad = res.module * k * (QUIET() + 2);
   const x0 = Math.max(0, Math.floor(Math.min(...keys.map(a => q[a].x)) - pad));
   const y0 = Math.max(0, Math.floor(Math.min(...keys.map(a => q[a].y)) - pad));
   const x1 = Math.min(vw, Math.ceil(Math.max(...keys.map(a => q[a].x)) + pad));
@@ -1767,8 +1670,6 @@ function grabFullRes(res, vw, vh) {
   for (let i = 0; i < frame.length; i++) acc[i] += frame[i];
   accN++;
 
-  // keep the single sharpest frame too — averaging kills noise, but if the
-  // hand drifted at all, one crisp frame can beat the mean
   const sh = sharpness(frame, size);
   if (sh > bestSharp) { bestSharp = sh; bestFrame = frame; }
   lockedMeta = res;
@@ -1838,7 +1739,6 @@ function render() {
   $('i-out').textContent = size + '×' + size + 'px';
 }
 
-// ── overlays ──────────────────────────────────────────────────────
 function drawOverlay(res, map) {
   const ctx = oCtx;
   ctx.clearRect(0, 0, overlay.width, overlay.height);
@@ -1850,7 +1750,6 @@ function drawOverlay(res, map) {
   for (let i = 1; i < 4; i++) ctx.lineTo(P[i][0], P[i][1]);
   ctx.closePath();
   ctx.stroke();
-  // thicken the two solid L edges so the orientation is readable at a glance
   ctx.strokeStyle = 'rgba(255,255,255,.95)';
   ctx.lineWidth = 4 * DPR;
   ctx.beginPath();
@@ -1863,7 +1762,6 @@ function drawOverlay(res, map) {
   ctx.fillStyle = '#fff';
   ctx.font = '600 ' + (11 * DPR) + 'px ui-monospace, monospace';
   ctx.fillText('L', P[3][0] + 9 * DPR, P[3][1] - 7 * DPR);
-  // timing modules actually used by the fit
   ctx.fillStyle = 'rgba(62,166,255,.95)';
   for (const m of [...res.timing.modulesA, ...res.timing.modulesB]) {
     const p = map({ x: m[0], y: m[1] });
@@ -1889,7 +1787,6 @@ function drawDebug(res, pw, ph) {
   dCtx.putImageData(img, 0, 0);
   const T = p => [ox + p[0] * s, oy + p[1] * s];
 
-  // the L blob's simplified hull — this is what the decision is made on
   const poly = res.ok ? res.L.poly : (res.tried[0] && res.tried[0].poly);
   if (poly && poly.length) {
     dCtx.strokeStyle = res.ok ? 'rgba(255,193,7,.95)' : 'rgba(255,68,68,.9)';
@@ -1922,7 +1819,6 @@ function drawDebug(res, pw, ph) {
     : (res.tried.length ? 'rejected: ' + res.tried[0].reason : 'no candidate blobs');
 }
 
-// ── small helpers ─────────────────────────────────────────────────
 function rotationOf(q) {
   return Math.atan2(q.br.y - q.bl.y, q.br.x - q.bl.x) * 180 / Math.PI;
 }
@@ -1943,7 +1839,6 @@ function setStatus(t, c) { $('stxt').textContent = t; $('dot').style.background 
 function say(t) { $('msg').textContent = t; }
 function setT(id, ms) { $(id).textContent = ms.toFixed(1); }
 
-// ── controls ──────────────────────────────────────────────────────
 $('again').addEventListener('click', () => {
   phase = 'scanning'; stableHist = []; acc = null; accN = 0; bestFrame = null;
   track = null; trackMiss = 0; riseHist = []; blurBase = null;
